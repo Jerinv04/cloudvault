@@ -1,0 +1,6 @@
+CloudVault project notes
+
+The team will finish the serverless backend this week. Lambda functions handle
+uploads, listing, share links and AI tagging. The React frontend is hosted on
+Amazon S3 behind CloudFront. Next milestone: end-to-end testing and the final
+architecture walkthrough for the Cloud Computing course at MIT World Peace University.

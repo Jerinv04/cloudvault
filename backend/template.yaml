@@ -1,0 +1,498 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  CloudVault - a secure serverless file storage & sharing system with
+  AI-powered access control (S3, DynamoDB, Lambda, API Gateway, Cognito,
+  CloudFront, KMS, Rekognition, Comprehend, CloudWatch).
+
+Parameters:
+  StageName:
+    Type: String
+    Default: dev
+    AllowedPattern: "[a-z0-9]+"
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: >
+      Origin allowed by CORS. Use "*" for the first deploy, then redeploy with
+      your CloudFront URL (e.g. https://d123abc.cloudfront.net) to lock it down.
+  MaxUploadMB:
+    Type: Number
+    Default: 25
+    MinValue: 1
+    MaxValue: 100
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    CodeUri: src/
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref FilesTable
+        BUCKET_NAME: !Sub cloudvault-files-${AWS::AccountId}-${AWS::Region}
+        ALLOWED_ORIGIN: !Ref AllowedOrigin
+        MAX_UPLOAD_MB: !Ref MaxUploadMB
+
+Resources:
+  # ------------------------------------------------------------------ KMS
+  VaultKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CloudVault customer-managed key for encrypting stored files
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: "kms:*"
+            Resource: "*"
+
+  VaultKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-files
+      TargetKeyId: !Ref VaultKey
+
+  # ------------------------------------------------------------------ S3 (files)
+  FilesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Name is built with !Sub (not !Ref) so Lambda policies can reference it
+      # without creating a circular dependency with the S3 -> tagFile trigger.
+      BucketName: !Sub cloudvault-files-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt VaultKey.Arn
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedMethods: [POST, GET]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  FilesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FilesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt FilesBucket.Arn
+              - !Sub ${FilesBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ------------------------------------------------------------------ DynamoDB
+  FilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: fileId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: fileId
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ------------------------------------------------------------------ Cognito
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub ${AWS::StackName}-web
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # ------------------------------------------------------------------ API Gateway (REST)
+  VaultApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-api
+      StageName: !Ref StageName
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+      Auth:
+        DefaultAuthorizer: CognitoAuth
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuth:
+            UserPoolArn: !GetAtt UserPool.Arn
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${AllowedOrigin}'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 20
+          MetricsEnabled: true
+
+  # ------------------------------------------------------------------ Lambda functions
+  UploadFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Issues a pre-signed S3 POST so the browser uploads directly to S3
+      Handler: upload_file.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt FilesTable.Arn
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::cloudvault-files-${AWS::AccountId}-${AWS::Region}/users/*
+            - Effect: Allow
+              Action: kms:GenerateDataKey
+              Resource: !GetAtt VaultKey.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VaultApi
+            Path: /files/upload-url
+            Method: post
+
+  ListFilesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Lists the signed-in user's files (optionally filtered by AI tag)
+      Handler: list_files.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !GetAtt FilesTable.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VaultApi
+            Path: /files
+            Method: get
+
+  GenerateShareLinkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Creates a time-limited signed download URL, enforcing AI access rules
+      Handler: generate_share_link.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt FilesTable.Arn
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::cloudvault-files-${AWS::AccountId}-${AWS::Region}/users/*
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: !GetAtt VaultKey.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VaultApi
+            Path: /files/{fileId}/share
+            Method: post
+
+  TagFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: AI auto-tagging with Rekognition (images) and Comprehend (text)
+      Handler: tag_file.handler
+      Timeout: 60
+      MemorySize: 512
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt FilesTable.Arn
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::cloudvault-files-${AWS::AccountId}-${AWS::Region}/users/*
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: !GetAtt VaultKey.Arn
+            - Effect: Allow
+              Action:
+                - rekognition:DetectLabels
+                - comprehend:DetectDominantLanguage
+                - comprehend:DetectKeyPhrases
+                - comprehend:DetectEntities
+                - comprehend:DetectPiiEntities
+              Resource: "*"
+      Events:
+        FileUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref FilesBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: users/
+        Retag:
+          Type: Api
+          Properties:
+            RestApiId: !Ref VaultApi
+            Path: /files/{fileId}/tag
+            Method: post
+
+  # ------------------------------------------------------------------ CloudWatch
+  UploadFileLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${UploadFileFunction}
+      RetentionInDays: 14
+  ListFilesLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ListFilesFunction}
+      RetentionInDays: 14
+  GenerateShareLinkLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${GenerateShareLinkFunction}
+      RetentionInDays: 14
+  TagFileLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${TagFileFunction}
+      RetentionInDays: 14
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-api-5xx
+      AlarmDescription: API Gateway is returning server errors
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub ${AWS::StackName}-api
+        - Name: Stage
+          Value: !Ref StageName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  TagFileErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-tagfile-errors
+      AlarmDescription: AI tagging Lambda is failing
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TagFileFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${AWS::StackName}-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+             "properties": {"title": "CloudVault activity", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+               "metrics": [["CloudVault", "UploadUrlsIssued"], ["CloudVault", "FilesUploaded"], ["CloudVault", "FilesTagged"],
+                           ["CloudVault", "ShareLinksCreated"], ["CloudVault", "SensitiveFilesDetected"], ["CloudVault", "ShareLinksBlocked"]]}},
+            {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+             "properties": {"title": "Lambda invocations", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+               "metrics": [["AWS/Lambda", "Invocations", "FunctionName", "${UploadFileFunction}"],
+                           ["AWS/Lambda", "Invocations", "FunctionName", "${ListFilesFunction}"],
+                           ["AWS/Lambda", "Invocations", "FunctionName", "${GenerateShareLinkFunction}"],
+                           ["AWS/Lambda", "Invocations", "FunctionName", "${TagFileFunction}"]]}},
+            {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+             "properties": {"title": "Lambda errors", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+               "metrics": [["AWS/Lambda", "Errors", "FunctionName", "${UploadFileFunction}"],
+                           ["AWS/Lambda", "Errors", "FunctionName", "${ListFilesFunction}"],
+                           ["AWS/Lambda", "Errors", "FunctionName", "${GenerateShareLinkFunction}"],
+                           ["AWS/Lambda", "Errors", "FunctionName", "${TagFileFunction}"]]}},
+            {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+             "properties": {"title": "API Gateway requests & errors", "region": "${AWS::Region}", "stat": "Sum", "period": 300, "view": "timeSeries",
+               "metrics": [["AWS/ApiGateway", "Count", "ApiName", "${AWS::StackName}-api", "Stage", "${StageName}"],
+                           ["AWS/ApiGateway", "4XXError", "ApiName", "${AWS::StackName}-api", "Stage", "${StageName}"],
+                           ["AWS/ApiGateway", "5XXError", "ApiName", "${AWS::StackName}-api", "Stage", "${StageName}"]]}}
+          ]
+        }
+
+  # ------------------------------------------------------------------ Frontend: S3 + CloudFront
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-frontend-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: CloudVault React frontend
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_200
+        Origins:
+          - Id: FrontendOrigin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6          # Managed-CachingOptimized
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${VaultApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  Region:
+    Value: !Ref AWS::Region
+  FilesBucketName:
+    Value: !Ref FilesBucket
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  DistributionId:
+    Value: !Ref FrontendDistribution
+  CloudFrontUrl:
+    Value: !Sub https://${FrontendDistribution.DomainName}
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-dashboard

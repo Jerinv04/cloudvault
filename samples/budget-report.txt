@@ -1,0 +1,9 @@
+Q3 Cloud Infrastructure Budget Report
+
+Summary: AWS spend this quarter stayed under the allocated budget thanks to
+serverless architecture - Lambda, DynamoDB on-demand and S3 only bill for
+actual usage. Rekognition and Comprehend costs were the largest AI line item,
+driven mainly by image tagging volume. KMS key rotation and CloudWatch
+logging added a small fixed cost. Recommendation: keep the current
+architecture for the next quarter and monitor the sensitive-file detection
+rate as a proxy for data governance.

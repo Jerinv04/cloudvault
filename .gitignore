@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+.aws-sam/
+__pycache__/
+.pytest_cache/
+backend/local_dev/local_env.json

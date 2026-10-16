@@ -1,0 +1,10 @@
+Project team contact sheet (sample data for the PII demo - not real people)
+
+Name: Priya Sharma
+Email: priya.sharma@example.com
+Phone: +1 555-0142
+
+Name: Rahul Mehta
+Email: rahul.mehta@example.com
+Phone: +1 555-0199
+Address: 221 Example Street, Pune
